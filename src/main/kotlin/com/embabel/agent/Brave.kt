@@ -3,6 +3,7 @@ package com.embabel.agent
 import com.fasterxml.jackson.annotation.JsonPropertyDescription
 import com.fasterxml.jackson.annotation.JsonSubTypes
 import com.fasterxml.jackson.annotation.JsonTypeInfo
+import org.slf4j.LoggerFactory
 import org.springframework.ai.tool.annotation.Tool
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty
@@ -12,6 +13,9 @@ import org.springframework.http.HttpMethod
 import org.springframework.stereotype.Service
 import org.springframework.web.client.RestTemplate
 import java.time.Instant
+import java.util.concurrent.Semaphore
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.locks.LockSupport
 
 data class WebSearchRequest(
     val query: String,
@@ -27,9 +31,15 @@ abstract class BraveSearchService(
     private val apiKey: String,
     private val baseUrl: String,
     private val restTemplate: RestTemplate,
+    private val pacer: BravePacer,
 ) {
 
-    fun search(request: WebSearchRequest): BraveSearchResults {
+    private val log = LoggerFactory.getLogger(javaClass)
+    private val permit = Semaphore(1, true)
+    @Volatile private var readyAtNanos: Long = 0L
+
+    fun search(request: WebSearchRequest): BraveSearchResults = runPaced  {
+        log.info("************** Searching for $name: $request")
         val headers = HttpHeaders().apply {
             set("X-Subscription-Token", apiKey)
             set("Accept", "application/json")
@@ -50,10 +60,11 @@ abstract class BraveSearchService(
         ).body ?: run {
             throw RuntimeException("No response body")
         }
-        return rawResponse.toBraveSearchResults(request)
+        rawResponse.toBraveSearchResults(request)
     }
 
-    fun searchRaw(request: WebSearchRequest): String {
+    fun searchRaw(request: WebSearchRequest): String = runPaced  {
+        log.info("************** Searching RAW for $name: $request")
         val headers = HttpHeaders().apply {
             set("X-Subscription-Token", apiKey)
             set("Accept", "application/json")
@@ -61,7 +72,7 @@ abstract class BraveSearchService(
 
         val entity = HttpEntity<String>(headers)
 
-        return restTemplate.exchange(
+        restTemplate.exchange(
             "$baseUrl?q={query}&count={count}&offset={offset}",
             HttpMethod.GET,
             entity,
@@ -75,45 +86,53 @@ abstract class BraveSearchService(
             throw RuntimeException("No response body")
         }
     }
+
+    private fun <T> runPaced(block: () -> T): T = pacer.pace(block)
 }
 
 @ConditionalOnProperty("BRAVE_API_KEY")
 @Service
 class BraveWebSearchService(
     @Value("\${BRAVE_API_KEY}") apiKey: String,
-    restTemplate: RestTemplate
+    restTemplate: RestTemplate,
+    bravePacer: BravePacer,
 ) : BraveSearchService(
     name = "Brave web search",
     description = "Search the web with Brave",
     apiKey = apiKey,
     baseUrl = "https://api.search.brave.com/res/v1/web/search",
     restTemplate = restTemplate,
+    pacer = bravePacer
 )
 
 @ConditionalOnProperty("BRAVE_API_KEY")
 @Service
 class BraveNewsSearchService(
     @Value("\${BRAVE_API_KEY}") apiKey: String,
-    restTemplate: RestTemplate
+    restTemplate: RestTemplate,
+    bravePacer: BravePacer,
 ) : BraveSearchService(
     name = "Brave news search",
     description = "Search for news with Brave",
     apiKey = apiKey,
     baseUrl = "https://api.search.brave.com/res/v1/news/search",
     restTemplate = restTemplate,
+    pacer = bravePacer
 )
 
 @ConditionalOnProperty("BRAVE_API_KEY")
 @Service
 class BraveImageSearchService(
     @Value("\${BRAVE_API_KEY}") apiKey: String,
-    restTemplate: RestTemplate
+    restTemplate: RestTemplate,
+    bravePacer: BravePacer,
 ) : BraveSearchService(
     name = "Brave news search",
     description = "Search for news with Brave",
     apiKey = apiKey,
     baseUrl = "https://api.search.brave.com/res/v1/images/search",
     restTemplate = restTemplate,
+    pacer = bravePacer
 ) {
 
     @Tool(description = "Brave image search")
@@ -127,13 +146,15 @@ class BraveImageSearchService(
 @Service
 class BraveVideoSearchService(
     @Value("\${BRAVE_API_KEY}") apiKey: String,
-    restTemplate: RestTemplate
+    restTemplate: RestTemplate,
+    bravePacer: BravePacer
 ) : BraveSearchService(
     name = "Brave video search",
     description = "Search for videos with Brave",
     apiKey = apiKey,
     baseUrl = "https://api.search.brave.com/res/v1/videos/search",
     restTemplate = restTemplate,
+    pacer = bravePacer
 )
 
 data class BraveSearchResults(
