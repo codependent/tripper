@@ -20,44 +20,30 @@ import com.embabel.agent.api.annotation.*
 import com.embabel.agent.api.common.OperationContext
 import com.embabel.agent.api.common.SomeOf
 import com.embabel.agent.api.common.create
-import com.embabel.agent.config.models.AnthropicModels
-import com.embabel.agent.config.models.OpenAiModels
 import com.embabel.agent.core.CoreToolGroups
 import com.embabel.agent.core.last
 import com.embabel.agent.prompt.ResponseFormat
 import com.embabel.agent.prompt.element.ToolCallControl
 import com.embabel.agent.prompt.persona.Persona
 import com.embabel.agent.prompt.persona.RoleGoalBackstory
+import com.embabel.common.ai.model.LlmOptions
 import com.embabel.common.util.StringTransformer
 import com.embabel.tripper.config.ToolsConfig
 import com.embabel.tripper.util.ImageChecker
 import org.slf4j.LoggerFactory
 import org.springframework.boot.context.properties.ConfigurationProperties
 
-val HermesPersona = Persona(
-    name = "Hermes",
-    persona = "You are an expert travel planner",
-    voice = "friendly and concise",
-    objective = "Make a detailed travel plan meeting requirements",
-)
-
-val Researcher = RoleGoalBackstory(
-    role = "Researcher",
-    goal = "Research points of interest for a travel plan",
-    backstory = "You are an expert researcher who can find interesting stories about art, culture, and famous people associated with places.",
-)
-
 @ConfigurationProperties("embabel.tripper")
 data class TravelPlannerProperties(
     val wordCount: Int = 700,
     val imageWidth: Int = 800,
-    val travelPlannerPersona: Persona = HermesPersona,
-    val researcher: RoleGoalBackstory = Researcher,
+    val planner: Persona,
+    val researcher: RoleGoalBackstory,
     val toolCallControl: ToolCallControl = ToolCallControl(),
-    val thinkerModel: String = OpenAiModels.GPT_41,
-    val researcherModel: String = OpenAiModels.GPT_41_MINI,
-    val writerModel: String = AnthropicModels.CLAUDE_37_SONNET,
-    val maxConcurrency: Int = 15,
+    val thinkerLlm: LlmOptions,
+    val researcherLlm: LlmOptions,
+    val writerLlm: LlmOptions,
+    val maxConcurrency: Int = 12,
 )
 
 /**
@@ -109,9 +95,9 @@ class TripperAgent(
         context: OperationContext,
     ): ItineraryIdeas {
         return context.ai()
-            .withLlm(config.thinkerModel)
+            .withLlm(config.thinkerLlm)
             .withPromptElements(
-                config.travelPlannerPersona,
+                config.planner,
                 travelers,
             ).withTools(
                 CoreToolGroups.WEB, CoreToolGroups.MAPS, CoreToolGroups.MATH,
@@ -141,7 +127,7 @@ class TripperAgent(
             itineraryIdeas.pointsOfInterest.sortedBy { it.name }.joinToString { it.name },
         )
         val promptRunner = context.ai()
-            .withLlm(config.researcherModel)
+            .withLlm(config.researcherLlm)
             .withPromptElements(config.researcher, travelers, config.toolCallControl)
             .withTools(
                 CoreToolGroups.WEB,
@@ -176,6 +162,9 @@ class TripperAgent(
         )
     }
 
+    /**
+     * Use a good LLM to build a plan based on research.
+     */
     @Action
     fun proposeTravelPlan(
         travelBrief: JourneyTravelBrief,
@@ -184,10 +173,10 @@ class TripperAgent(
         context: OperationContext,
     ): ProposedTravelPlan {
         return context.ai()
-            .withLlm(config.writerModel)
+            .withLlm(config.writerLlm)
             .withTools(CoreToolGroups.WEB, CoreToolGroups.MAPS, CoreToolGroups.MATH)
             .withPromptElements(
-                config.travelPlannerPersona, travelers, ResponseFormat.HTML,
+                config.planner, travelers, ResponseFormat.HTML,
             )
             .create(
                 prompt = """
@@ -206,8 +195,10 @@ class TripperAgent(
                 Write up in ${config.wordCount} words or less.
                 Include links in text where appropriate and in the links field.
                 
-                The Day field locationAndCountry field should be in the format <location,+Country> e.g.
+                Include the location for each day.
+                The "locationAndCountry" field for each day should be in the format <location,+Country> e.g.
                 Ghent,+Belgium
+                If successive days are in the same town, just repeat the same location.
 
                 Put image links where appropriate in text and also in the links field.
                 Links must specify opening in a new window.
@@ -254,7 +245,7 @@ class TripperAgent(
         }.sortedBy { it.days.first().date }
 
         val stayFinderPromptRunner = context.ai()
-            .withLlm(config.researcherModel)
+            .withLlm(config.researcherLlm)
             .withPromptContributor(travelers)
             .withTools(ToolsConfig.AIRBNB, CoreToolGroups.MATH)
         val foundStays = context.parallelMap(stays, maxConcurrency = config.maxConcurrency) { stay ->
